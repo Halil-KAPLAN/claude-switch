@@ -1,3 +1,3 @@
-# Bash script'leri Windows'ta da LF kalmalı, yoksa "bad interpreter" hatası verir
+# Bash scripts must stay LF on Windows too, otherwise they fail with "bad interpreter"
 * text=auto eol=lf
 *.cmd text eol=crlf

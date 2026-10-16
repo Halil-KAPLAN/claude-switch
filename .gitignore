@@ -1,4 +1,4 @@
-# Credentials ASLA bu repoya girmemeli
+# Credentials must NEVER end up in this repo
 accounts/
 *.credentials.json
 .credentials.json

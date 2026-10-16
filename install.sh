@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# claude-switch kurulumu — Linux, WSL ve Windows (Git Bash) üzerinde çalışır.
+# claude-switch installer — works on Linux, WSL and Windows (Git Bash).
 #
-#   ./install.sh     ~/.local/bin/cs komutunu kurar, ~/.claude/settings.json'a
-#                    respondToBashCommands=false ve cs hook'larını ekler.
+#   ./install.sh     installs the ~/.local/bin/cs command and adds
+#                    respondToBashCommands=false and the cs hooks to ~/.claude/settings.json.
 #
-# Tekrar çalıştırmak güvenlidir: var olan ayarlara dokunmaz, hook'ları çiftlemez.
-# Kurulan 'cs' bu repodaki bin/cs'i çağıran küçük bir shim'dir; 'git pull' yeterli.
+# Safe to re-run: it leaves existing settings alone and never duplicates hooks.
+# The installed 'cs' is a small shim that calls bin/cs in this repo; 'git pull' is enough to update.
 
 set -euo pipefail
 
@@ -31,40 +31,39 @@ for p in python3 python; do
     PY="$p"; break
   fi
 done
-[ -n "$PY" ] || die "python3 bulunamadı — cs için gerekli"
-[ -f "$SRC" ] || die "$SRC yok"
+[ -n "$PY" ] || die "python3 not found — cs needs it"
+[ -f "$SRC" ] || die "$SRC not found"
 chmod +x "$SRC" 2>/dev/null || true
 mkdir -p "$BIN_DIR" "$CLAUDE_DIR"
 
-# --- 1) ~/.local/bin/cs shim'i ------------------------------------------------
+# --- 1) ~/.local/bin/cs shim ----------------------------------------------------
 SHIM="$BIN_DIR/cs"
 SHIM_BODY="#!/usr/bin/env bash
-# claude-switch shim — asıl script: $SRC
+# claude-switch shim — actual script: $SRC
 exec bash \"$SRC\" \"\$@\""
 
 if [ -e "$SHIM" ] && ! grep -q '^# claude-switch shim' "$SHIM" 2>/dev/null; then
   mv "$SHIM" "$SHIM.bak-$STAMP"
-  warn "eski cs yedeklendi: $SHIM.bak-$STAMP"
+  warn "backed up the old cs: $SHIM.bak-$STAMP"
 fi
 printf '%s\n' "$SHIM_BODY" > "$SHIM"
 chmod +x "$SHIM"
-ok "cs kuruldu: $SHIM → $SRC"
+ok "installed cs: $SHIM → $SRC"
 
-# --- 2) Windows: PowerShell/cmd'den de çalışsın diye cs.cmd -------------------
+# --- 2) Windows: cs.cmd so it also works from PowerShell/cmd --------------------
 if [ "$WINDOWS" = 1 ]; then
   GIT_ROOT="$(cygpath -w /)"
   BASH_EXE="${GIT_ROOT%\\}\\bin\\bash.exe"
   [ -f "$(cygpath -u "$BASH_EXE")" ] || BASH_EXE="$(cygpath -w "$(command -v bash)")"
   printf '@"%s" "%s" %%*\r\n' "$BASH_EXE" "$(cygpath -w "$SRC")" > "$BIN_DIR/cs.cmd"
-  ok "cs.cmd kuruldu: $BIN_DIR/cs.cmd"
+  ok "installed cs.cmd: $BIN_DIR/cs.cmd"
 fi
 
-# --- 3) settings.json: respondToBashCommands + hook'lar ------------------------
-[ -f "$SETTINGS" ] && cp -p "$SETTINGS" "$SETTINGS.bak-$STAMP"
-PYTHONUTF8=1 "$PY" - "$SETTINGS" <<'PY'
-import json, os, re, sys
+# --- 3) settings.json: respondToBashCommands + hooks ----------------------------
+PYTHONUTF8=1 "$PY" - "$SETTINGS" "$STAMP" <<'PY'
+import json, os, re, shutil, sys
 
-path = sys.argv[1]
+path, stamp = sys.argv[1], sys.argv[2]
 cfg = {}
 if os.path.exists(path):
     with open(path, encoding="utf-8") as f:
@@ -87,7 +86,7 @@ WANT = [
 hooks = cfg.setdefault("hooks", {})
 for event, sub, spec in WANT:
     groups = hooks.setdefault(event, [])
-    # Herhangi bir yoldan çağrılan "cs <sub>" zaten varsa (eski mutlak yollar dahil) dokunma
+    # Skip it if "cs <sub>" is already called from any path (old absolute paths included)
     pat = re.compile(r'(^|[/"\s])cs"?\s+' + sub + r'\b')
     exists = any(pat.search(h.get("command", ""))
                  for g in groups for h in g.get("hooks", []))
@@ -101,6 +100,9 @@ for event, sub, spec in WANT:
     changed.append(f"hook {event}: cs {sub}")
 
 if changed:
+    # Back up only when something actually changes, so re-running doesn't pile up copies
+    if os.path.exists(path):
+        shutil.copy2(path, f"{path}.bak-{stamp}")
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -109,17 +111,17 @@ if changed:
     for c in changed:
         print(f"  + {c}")
 else:
-    print("  (settings.json zaten güncel)")
+    print("  (settings.json is already up to date)")
 PY
 ok "settings.json: $SETTINGS"
 
-# --- 4) PATH kontrolü ----------------------------------------------------------
+# --- 4) PATH check --------------------------------------------------------------
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) warn "$BIN_DIR PATH'te değil — shell profiline ekle: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+  *) warn "$BIN_DIR is not on your PATH — add this to your shell profile: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
 echo
-ok "kurulum tamam. Açık Claude oturumlarını yeniden başlat, sonra:"
-echo "    !cs add <ad>    # şu an giriş yapılı hesabı kaydet"
+ok "installation complete. Restart any open Claude sessions, then:"
+echo "    !cs add <name>    # save the currently logged-in account"
 echo "    !cs status"
