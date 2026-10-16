@@ -34,6 +34,9 @@ The installer:
 
 Running it again is safe; hooks are never duplicated. Restart any open Claude Code sessions afterwards.
 
+To update, just `git pull` — the shim runs the script from the repo, so no reinstall is needed.
+If you move the repo, run `install.sh` again.
+
 ## Adding accounts on a new machine
 
 Credentials are **not** stored in this repo and never should be. Add your accounts once on each machine:
@@ -55,15 +58,6 @@ A running Claude Code session keeps using the account it started with, so restar
 
 - **Terminal:** exit Claude Code and start `claude` again.
 - **VS Code extension:** press `Ctrl+Shift+P` (`Cmd+Shift+P` on macOS) and run **Developer: Reload Window**.
-
-## Updating
-
-```bash
-cd ~/claude-switch && git pull
-```
-
-The shim calls the script in the repo directly, so there's no need to reinstall.
-If you move the repo to a different folder, run `install.sh` again.
 
 ## Uninstalling
 
