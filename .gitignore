@@ -1,0 +1,6 @@
+# Credentials ASLA bu repoya girmemeli
+accounts/
+*.credentials.json
+.credentials.json
+.claude.json
+*.bak-*

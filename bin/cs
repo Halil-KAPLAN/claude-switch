@@ -1,0 +1,713 @@
+#!/usr/bin/env bash
+# cs — Claude Switch: Claude Code hesapları arasında geçiş
+#
+#   cs status            Aktif hesabı ve tüm hesapların durumunu göster
+#   cs list              Hesapları listele (status'un kısa hali)
+#   cs use <ad>          <ad> hesabına geç
+#   cs add <ad>          Şu anki aktif credentials'ı yeni bir hesap olarak kaydet
+#   cs sync              Aktif credentials'ı kendi slotuna geri yaz (token refresh'i saklar)
+#   cs rm <ad>           Hesabı sil
+#   cs restore           Son yedeği .credentials.json'a geri yükle
+
+set -euo pipefail
+export PYTHONUTF8=1  # Windows: python open()/print UTF-8 kullansın
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+ACCOUNTS_DIR="$CLAUDE_DIR/accounts"
+CREDS="$CLAUDE_DIR/.credentials.json"
+# Hesabın e-posta/organizasyon bilgisi credentials'ta DEĞİL, bu dosyadaki
+# oauthAccount bloğunda tutulur. /usage bunu gösterir.
+CLAUDE_JSON="${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/.claude.json}"
+CLAUDE_JSON="${CLAUDE_JSON:-$HOME/.claude.json}"
+ACTIVE_FILE="$ACCOUNTS_DIR/.active"
+BACKUP_DIR="$ACCOUNTS_DIR/.backups"
+PY="${CS_PYTHON:-python3}"
+
+if [ -t 1 ]; then
+  R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[34m'; D=$'\033[2m'; BD=$'\033[1m'; N=$'\033[0m'
+else
+  R=; G=; Y=; B=; D=; BD=; N=
+fi
+
+die() { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+info() { printf '%s%s%s\n' "$D" "$*" "$N"; }
+ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
+
+command -v "$PY" >/dev/null 2>&1 || die "$PY bulunamadı (CS_PYTHON ile değiştirebilirsin)"
+mkdir -p "$ACCOUNTS_DIR" "$BACKUP_DIR"
+chmod 700 "$ACCOUNTS_DIR" "$BACKUP_DIR" 2>/dev/null || true
+
+slot() { printf '%s/%s.json' "$ACCOUNTS_DIR" "$1"; }
+slot_profile() { printf '%s/%s.profile.json' "$ACCOUNTS_DIR" "$1"; }
+
+# Canlı credentials işe yarar mı? Claude Code refresh başarısız olunca token'ları
+# BOŞALTIR; o boş hali slota kopyalamak hesabı kalıcı olarak yok eder.
+creds_usable() { slot_usable "$CREDS"; }
+
+slot_usable() {
+  [ -f "$1" ] || return 1
+  "$PY" - "$1" <<'PY'
+import json, sys
+try:
+    o = json.load(open(sys.argv[1])).get("claudeAiOauth") or {}
+except Exception:
+    sys.exit(1)
+sys.exit(0 if (o.get("accessToken") and o.get("refreshToken")) else 1)
+PY
+}
+
+# Canlı credentials'ı bir slota yaz — ama sadece güvenliyse.
+save_slot() {
+  local name="$1" mism
+  if ! creds_usable; then
+    warn "canlı credentials boş/geçersiz (çıkış yapılmış) → '$name' slotu KORUNDU"
+    return 0
+  fi
+  mism=$("$PY" - "$CREDS" "$(slot "$name")" "$CLAUDE_JSON" <<'PY'
+import json, sys
+
+def load(p):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+# Canlı oturumun organizasyonu: /login'in hemen ardından credentials'ta bu alan
+# HENÜZ YOKTUR, o yüzden ~/.claude.json'daki oauthAccount'a da bakıyoruz —
+# profil çekildiği anda orası dolar ve doğrulama penceresi kapanır.
+live = load(sys.argv[1]).get("organizationUuid") \
+    or (load(sys.argv[3]).get("oauthAccount") or {}).get("organizationUuid")
+slot = load(sys.argv[2]).get("organizationUuid")
+
+if live and slot and live != slot:
+    print("mismatch")
+PY
+)
+  if [ -n "$mism" ]; then
+    warn "canlı oturum '$name' slotundan farklı bir hesaba ait → slot KORUNDU"
+    warn "  yeni bir hesapsa: cs add <yeni-ad>"
+    return 0
+  fi
+  cp -p "$CREDS" "$(slot "$name")"
+  chmod 600 "$(slot "$name")"
+  save_profile "$name"
+  return 0
+}
+
+# ~/.claude.json içindeki oauthAccount bloğunu hesabın profil dosyasına kaydet.
+# ÖNEMLİ: profil gerçekten o hesaba ait mi diye organizationUuid ile doğrulanır.
+# Claude Code yeni hesabın profilini henüz çekmemişken geçiş yapılırsa, eski hesabın
+# bayat profili yanlış isimle mühürlenirdi — doğrulama tam olarak bunu engelliyor.
+# 2. argüman "force" ise doğrulama atlanır (kullanıcının açık talebi).
+save_profile() {
+  local name="$1" mode="${2:-verify}" out
+  [ -f "$CLAUDE_JSON" ] || return 0
+  out=$("$PY" - "$CLAUDE_JSON" "$(slot_profile "$name")" "$CREDS" "$mode" "$name" <<'PY'
+import json, sys, os
+cfg_path, dest, creds_path, mode, name = sys.argv[1:6]
+try:
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(0)
+oa = cfg.get("oauthAccount")
+if not oa:
+    sys.exit(0)
+
+if mode != "force":
+    try:
+        with open(creds_path) as f:
+            creds_org = json.load(f).get("organizationUuid")
+    except Exception:
+        creds_org = None
+    prof_org = oa.get("organizationUuid")
+    if not creds_org or not prof_org:
+        print(f"'{name}' profili doğrulanamadı (organizationUuid yok) → kaydedilmedi")
+        sys.exit(0)
+    if creds_org != prof_org:
+        print(f"'{name}' için bulunan profil başka hesaba ait ({oa.get('emailAddress','?')}) → kaydedilmedi")
+        sys.exit(0)
+
+tmp = dest + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(oa, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, dest)
+print(f"'{name}' profili kaydedildi: {oa.get('emailAddress', '?')}")
+PY
+)
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return 0
+}
+
+# Hesabın profilini ~/.claude.json'a yaz. Kayıtlı profil yoksa oauthAccount'u
+# tamamen siler — Claude Code açılışta sunucudan doğrusunu çekip yeniden oluşturur.
+install_profile() {
+  local name="$1" src
+  src=$(slot_profile "$name")
+  if [ ! -f "$CLAUDE_JSON" ]; then
+    warn "$CLAUDE_JSON yok — profil adımı atlandı"
+    return 0
+  fi
+  cp -p "$CLAUDE_JSON" "$BACKUP_DIR/claude-json-$(date +%Y%m%d-%H%M%S).json" 2>/dev/null || true
+  "$PY" - "$CLAUDE_JSON" "$src" "$CREDS" <<'PY'
+import json, sys, os
+cfg_path, prof_path, creds_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(cfg_path) as f:
+    cfg = json.load(f)
+
+prof = None
+if os.path.exists(prof_path):
+    try:
+        with open(prof_path) as f:
+            prof = json.load(f)
+    except Exception:
+        prof = None
+
+# Kayıtlı profil gerçekten yeni hesaba mı ait? Credentials'ta organizationUuid varsa
+# karşılaştır; uyuşmuyorsa profili kullanma, sildir ki sunucudan doğrusu gelsin.
+if prof is not None:
+    try:
+        with open(creds_path) as f:
+            creds_org = json.load(f).get("organizationUuid")
+    except Exception:
+        creds_org = None
+    if creds_org and prof.get("organizationUuid") and creds_org != prof["organizationUuid"]:
+        print(f"kayıtlı profil bu hesaba ait değil ({prof.get('emailAddress','?')}) → yok sayıldı")
+        prof = None
+
+if prof is not None:
+    cfg["oauthAccount"] = prof
+    print(f"profil geri yüklendi: {prof.get('emailAddress', '?')}")
+else:
+    if cfg.pop("oauthAccount", None) is None:
+        print("kayıtlı profil yok; oauthAccount zaten boştu")
+    else:
+        print("kayıtlı profil yok → oauthAccount silindi, Claude Code sunucudan çekecek")
+tmp = cfg_path + ".cs-tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, cfg_path)
+PY
+}
+
+valid_name() {
+  case "$1" in
+    ''|.*|*/*|*' '*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+accounts() {
+  local f b
+  for f in "$ACCOUNTS_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f" .json)
+    case "$b" in .*|*.profile) continue ;; esac
+    printf '%s\n' "$b"
+  done
+}
+
+active_name() {
+  [ -f "$ACTIVE_FILE" ] && tr -d '[:space:]' < "$ACTIVE_FILE" || true
+}
+
+# .credentials.json ile hangi slotun eşleştiğini refreshToken üzerinden bul.
+# Birden fazla slot eşleşirse (aynı hesabın kopyaları) kayıtlı aktif isim önceliklidir.
+detect_active() {
+  [ -f "$CREDS" ] || return 0
+  "$PY" - "$CREDS" "$ACCOUNTS_DIR" "$(active_name)" <<'PY'
+import json, sys, os, glob
+def rt(p):
+    try:
+        with open(p) as f:
+            return json.load(f).get("claudeAiOauth", {}).get("refreshToken")
+    except Exception:
+        return None
+cur = rt(sys.argv[1])
+recorded = sys.argv[3] if len(sys.argv) > 3 else ""
+if cur:
+    matches = []
+    for p in sorted(glob.glob(os.path.join(sys.argv[2], "*.json"))):
+        name = os.path.basename(p)[:-5]
+        if name.startswith("."):
+            continue
+        if rt(p) == cur:
+            matches.append(name)
+    if matches:
+        print(recorded if recorded in matches else matches[0])
+PY
+}
+
+resolve_active() {
+  local a d
+  d=$(detect_active)
+  if [ -n "$d" ]; then
+    printf '%s\n' "$d" > "$ACTIVE_FILE"
+    printf '%s\n' "$d"
+    return
+  fi
+  a=$(active_name)
+  printf '%s\n' "$a"
+}
+
+backup_creds() {
+  [ -f "$CREDS" ] || return 0
+  local dest
+  dest="$BACKUP_DIR/credentials-$(date +%Y%m%d-%H%M%S).json"
+  cp -p "$CREDS" "$dest"
+  chmod 600 "$dest"
+  # sadece son 10 yedeği tut
+  ls -1t "$BACKUP_DIR"/credentials-*.json 2>/dev/null | tail -n +11 | while read -r old; do rm -f "$old"; done
+}
+
+# Bir hesap slotunu geçerli bir .credentials.json haline getirip stdout'a yazar.
+# Eksik scopes/subscriptionType alanlarını şablon dosyadan (mevcut aktif creds) tamamlar.
+# organizationUuid KOPYALANMAZ — o hesaba özeldir, Claude Code ilk refresh'te doldurur.
+normalize() {
+  "$PY" - "$1" "${2:-}" <<'PY'
+import json, sys, os
+FALLBACK_SCOPES = ["user:inference"]
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+oauth = data.get("claudeAiOauth")
+if not isinstance(oauth, dict):
+    sys.exit("claudeAiOauth alanı yok veya bozuk: " + sys.argv[1])
+for k in ("accessToken", "refreshToken"):
+    if not oauth.get(k):
+        sys.exit(f"{k} eksik: {sys.argv[1]}")
+
+tpl = {}
+tpl_path = sys.argv[2] if len(sys.argv) > 2 else ""
+if tpl_path and os.path.exists(tpl_path):
+    try:
+        with open(tpl_path) as f:
+            tpl = json.load(f).get("claudeAiOauth", {}) or {}
+    except Exception:
+        tpl = {}
+
+if not oauth.get("scopes"):
+    oauth["scopes"] = tpl.get("scopes") or FALLBACK_SCOPES
+# subscriptionType / rateLimitTier ŞABLONDAN KOPYALANMAZ — plan hesaba özeldir.
+# Eksikse boş bırakılır; Claude Code ilk token refresh'inde sunucudan doldurur.
+if not oauth.get("expiresAt"):
+    oauth["expiresAt"] = 0
+
+json.dump(data, sys.stdout, indent=2)
+PY
+}
+
+print_row() {
+  local name="$1" marker="$2"
+  "$PY" - "$(slot "$name")" "$name" "$marker" "$(slot_profile "$name")" <<'PY'
+import json, sys, time, os
+path, name, marker = sys.argv[1], sys.argv[2], sys.argv[3]
+prof_path = sys.argv[4] if len(sys.argv) > 4 else ""
+email = "-"
+if prof_path and os.path.exists(prof_path):
+    try:
+        with open(prof_path) as f:
+            email = json.load(f).get("emailAddress") or "-"
+    except Exception:
+        pass
+try:
+    with open(path) as f:
+        o = json.load(f).get("claudeAiOauth", {})
+except Exception as e:
+    print(f"  {marker} {name:<12} <okunamadı: {e}>")
+    sys.exit()
+exp = o.get("expiresAt") or 0
+now = time.time() * 1000
+if not (o.get("accessToken") and o.get("refreshToken")):
+    print(f"  {marker} {name:<10} {'-':<9} {email:<26} token yok → /login gerekli")
+    sys.exit()
+rexp0 = o.get("refreshTokenExpiresAt")
+if rexp0 and rexp0 < now:
+    print(f"  {marker} {name:<10} {'-':<9} {email:<26} refresh token dolmuş → /login gerekli")
+    sys.exit()
+if exp:
+    left = (exp - now) / 1000
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(exp / 1000))
+    if left <= 0:
+        state = f"süresi dolmuş ({when})"
+    else:
+        h, m = int(left // 3600), int((left % 3600) // 60)
+        state = f"{when} ({h}s {m}dk kaldı)"
+else:
+    state = "expiresAt yok"
+TIERS = {
+    "default_claude_max_20x": "max 20x",
+    "default_claude_max_5x": "max 5x",
+    "default_claude_ai": None,      # ayırt edici değil, subscriptionType'ı göster
+}
+sub = o.get("subscriptionType")
+tier = o.get("rateLimitTier")
+label = TIERS.get(tier, tier) if tier else None
+plan = label or sub or "?"
+# Refresh token ~30 günde ölür ve her yenilemede tazelenir. Kullanılmayan bir hesabın
+# saati işlemeye devam eder ve kimse onu yenilemez → sessizce /login'e düşer.
+# Süre daralınca uyar ki hesabı bir kez açıp saati ileri atmak yetsin.
+rnote = ""
+if rexp0:
+    gun = (rexp0 - now) / 86400000
+    if gun < 7:
+        rnote = f"   ⚠ {gun:.0f} gün sonra /login gerekir — bu hesabı bir kez aç"
+print(f"  {marker} {name:<10} {plan:<9} {email:<26} {state}{rnote}")
+PY
+}
+
+cmd_status() {
+  local act cur
+  act=$(resolve_active)
+  printf '\n%sClaude hesapları%s  %s(%s)%s\n\n' "$BD" "$N" "$D" "$ACCOUNTS_DIR" "$N"
+  local found=0
+  while read -r a; do
+    [ -n "$a" ] || continue
+    found=1
+    if [ "$a" = "$act" ]; then
+      printf '%s' "$G"; print_row "$a" "●"; printf '%s' "$N"
+    else
+      print_row "$a" "○"
+    fi
+  done < <(accounts)
+  [ "$found" = 1 ] || warn "hiç hesap yok — 'cs add <ad>' ile ekleyebilirsin"
+  printf '\n'
+  if [ -n "$act" ]; then
+    printf '  Aktif: %s%s%s\n\n' "$BD$G" "$act" "$N"
+  else
+    warn "aktif hesap tespit edilemedi (.credentials.json hiçbir slotla eşleşmiyor)"
+    info "  'cs add <ad>' ile şu anki credentials'ı kaydedebilirsin"
+    printf '\n'
+  fi
+}
+
+cmd_sync() {
+  local act
+  act=$(resolve_active)
+  [ -n "$act" ] || die "aktif hesap bilinmiyor, önce 'cs add <ad>' çalıştır"
+  [ -f "$CREDS" ] || die "$CREDS yok"
+  save_slot "$act"
+  ok "aktif credentials + profil '$act' slotuna yazıldı"
+}
+
+# Hook'lardan çağrılır: sessizce aktif slotu güncel tutar, asla hata döndürmez.
+cmd_autosync() {
+  local act
+  act=$(resolve_active 2>/dev/null) || exit 0
+  [ -n "$act" ] || exit 0
+  creds_usable || exit 0
+  save_slot "$act" >/dev/null 2>&1
+  exit 0
+}
+
+cmd_use() {
+  local name="${1:-}"
+  [ -n "$name" ] || { cmd_status; die "kullanım: cs use <ad>"; }
+  valid_name "$name" || die "geçersiz hesap adı: $name"
+  [ -f "$(slot "$name")" ] || die "'$name' diye bir hesap yok. Mevcutlar: $(accounts | tr '\n' ' ')"
+
+  local act tmp
+  act=$(resolve_active)
+
+  if [ "$act" = "$name" ]; then
+    ok "'$name' zaten aktif"
+    return
+  fi
+
+  # 1) Mevcut aktif hesabın (refresh edilmiş olabilir) token'larını ve profilini kendi slotuna geri yaz
+  if [ -n "$act" ] && [ -f "$CREDS" ]; then
+    save_slot "$act"
+    info "'$act' hesabının güncel token'ları slotuna işlendi"
+  elif [ -f "$CREDS" ]; then
+    warn "aktif hesap tespit edilemedi; mevcut .credentials.json sadece yedeklendi"
+  fi
+
+  # 2) Yedek al
+  backup_creds
+
+  # 2b) Hedef slotta token yoksa: "login gerekli" durumuna geç.
+  # Credentials'ı kaldırıp profili temizliyoruz; Claude Code açılışta /login sorar,
+  # login sonrası autosync hook'u yeni token'ları bu hesabın slotuna yazar.
+  if ! slot_usable "$(slot "$name")"; then
+    rm -f "$CREDS"
+    printf '%s\n' "$name" > "$ACTIVE_FILE"
+    info "$(install_profile "$name")"
+    ok "aktif hesap → ${BD}$name${N}  ${Y}(token yok)${N}"
+    printf '\n%s  Bu hesapta kayıtlı token yok. Claude Code'"'"'u başlatıp %s/login%s yap.%s\n' "$D" "$BD" "$D$N$D" "$N"
+    printf '%s  Login sonrası token'"'"'lar otomatik olarak %s.json dosyasına kaydedilir.%s\n\n' "$D" "$name" "$N"
+    return
+  fi
+
+  # 3) Yeni hesabı yaz (atomik)
+  tmp=$(mktemp "$CLAUDE_DIR/.credentials.json.XXXXXX")
+  chmod 600 "$tmp"
+  if ! normalize "$(slot "$name")" "$CREDS" > "$tmp"; then
+    rm -f "$tmp"
+    die "'$name' hesabı geçerli değil"
+  fi
+  mv -f "$tmp" "$CREDS"
+  chmod 600 "$CREDS"
+  printf '%s\n' "$name" > "$ACTIVE_FILE"
+
+  # 4) E-posta/organizasyon bilgisini de takas et
+  info "$(install_profile "$name")"
+
+  ok "aktif hesap → ${BD}$name${N}"
+  print_row "$name" "●"
+  printf '\n%s! Claude Code'"'"'u KAPATMADAN geçiş yaptıysan bu değişiklik kaybolabilir:%s\n' "$Y" "$N"
+  printf '%s  çalışan oturum token'"'"'ı bellekte tutar ve çıkarken ~/.claude.json'"'"'ı%s\n' "$D" "$N"
+  printf '%s  kendi kopyasıyla üzerine yazar. Doğru sıra: önce çık, sonra cs use, sonra başlat.%s\n\n' "$D" "$N"
+}
+
+cmd_add() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "kullanım: cs add <ad>"
+  valid_name "$name" || die "geçersiz hesap adı: $name"
+  [ -f "$CREDS" ] || die "$CREDS yok — önce 'claude' ile login ol"
+  if [ -f "$(slot "$name")" ]; then
+    die "'$name' zaten var. Üzerine yazmak için: cs rm $name && cs add $name"
+  fi
+  creds_usable || die "canlı credentials boş/geçersiz — önce 'claude' ile login ol"
+  cp -p "$CREDS" "$(slot "$name")"
+  chmod 600 "$(slot "$name")"
+  save_profile "$name" force
+  printf '%s\n' "$name" > "$ACTIVE_FILE"
+  ok "şu anki credentials + profil '$name' olarak kaydedildi ve aktif işaretlendi"
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "kullanım: cs rm <ad>"
+  valid_name "$name" || die "geçersiz hesap adı: $name"
+  [ -f "$(slot "$name")" ] || die "'$name' diye bir hesap yok"
+  [ "$(resolve_active)" = "$name" ] && die "'$name' aktif hesap — önce başka bir hesaba geç"
+  cp -p "$(slot "$name")" "$BACKUP_DIR/removed-$name-$(date +%Y%m%d-%H%M%S).json"
+  rm -f "$(slot "$name")" "$(slot_profile "$name")"
+  ok "'$name' silindi (yedeği $BACKUP_DIR altında)"
+}
+
+cmd_profile() {
+  local sub="${1:-show}" name="${2:-}"
+  case "$sub" in
+    save)
+      [ -n "$name" ] || die "kullanım: cs profile save <ad>"
+      valid_name "$name" || die "geçersiz hesap adı: $name"
+      [ -f "$CLAUDE_JSON" ] || die "$CLAUDE_JSON yok"
+      save_profile "$name" force
+      [ -f "$(slot_profile "$name")" ] || die "$CLAUDE_JSON içinde oauthAccount bloğu yok"
+      cmd_profile show
+      ;;
+    clear)
+      [ -f "$CLAUDE_JSON" ] || die "$CLAUDE_JSON yok"
+      cp -p "$CLAUDE_JSON" "$BACKUP_DIR/claude-json-$(date +%Y%m%d-%H%M%S).json" 2>/dev/null || true
+      "$PY" - "$CLAUDE_JSON" <<'PY'
+import json, sys, os
+p = sys.argv[1]
+with open(p) as f:
+    cfg = json.load(f)
+if cfg.pop("oauthAccount", None) is None:
+    print("oauthAccount zaten yoktu")
+else:
+    print("oauthAccount silindi")
+tmp = p + ".cs-tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, p)
+PY
+      ok "Claude Code bir sonraki açılışta profili sunucudan çekecek"
+      ;;
+    show)
+      "$PY" - "$CLAUDE_JSON" <<'PY'
+import json, sys, os
+p = sys.argv[1]
+if not os.path.exists(p):
+    print("  (config yok)"); raise SystemExit
+oa = json.load(open(p)).get("oauthAccount")
+if not oa:
+    print("  oauthAccount: yok → Claude Code açılışta sunucudan çekecek"); raise SystemExit
+for k in ("emailAddress", "organizationName", "organizationType", "organizationRateLimitTier"):
+    if oa.get(k) is not None:
+        print(f"  {k:<26} {oa[k]}")
+PY
+      ;;
+    *) die "kullanım: cs profile [show|save <ad>|clear]" ;;
+  esac
+}
+
+# !cs komutlarının Claude Code geçmişinde bıraktığı izleri temizler.
+# Claude Code'da bunu kapatan bir ayar yok (--no-session-persistence yalnızca
+# --print modunda çalışır), o yüzden tek yol sonradan silmek.
+# Varsayılan KURU ÇALIŞMA; gerçekten silmek için: cs prune --apply
+cmd_prune() {
+  local apply=0
+  [ "${1:-}" = "--apply" ] && apply=1
+  "$PY" - "$HOME" "$apply" <<'PY'
+import json, os, sys, glob, shutil, time, re
+
+home, apply = sys.argv[1], sys.argv[2] == "1"
+BASH_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.S)
+hist = os.path.join(home, ".claude", "history.jsonl")
+projects = os.path.join(home, ".claude", "projects")
+
+def is_cs(disp):
+    d = (disp or "").strip()
+    return d.startswith("!cs") or d.startswith("! cs")
+
+# 1) history.jsonl: yukarı-ok geçmişindeki !cs satırları
+hit = 0
+lines = []
+if os.path.exists(hist):
+    with open(hist) as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                lines.append(line); continue
+            if is_cs(rec.get("display")):
+                hit += 1
+            else:
+                lines.append(line)
+print(f"history.jsonl : {hit} adet !cs satırı" + ("" if hit else " (temiz)"))
+
+# 2) Sadece !cs çalıştırılmış oturum dosyaları (session listesinde görünenler)
+def texts(msg):
+    c = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(c, str):
+        return [c]
+    if isinstance(c, list):
+        return [b.get("text", "") for b in c if isinstance(b, dict)]
+    return []
+
+OK_PREFIX = ("<bash-input>", "<bash-stdout>", "<bash-stderr>", "<local-command-caveat>")
+victims = []
+skipped_live = 0
+cur_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+now_s = time.time()
+
+for path in glob.glob(os.path.join(projects, "*", "*.jsonl")):
+    sid = os.path.basename(path)[:-6]
+    # Çalışan oturumun dosyasına DOKUNMA: Claude Code onu açık tutuyor ve
+    # taşınırsa bir sonraki yazmada yeniden oluşturur. Bir sonraki açılışta silinir.
+    if cur_sid and sid == cur_sid:
+        skipped_live += 1
+        continue
+    # Başka bir pencerede açık olabilir — son 2 dakikada yazılmışsa elleme
+    try:
+        if now_s - os.path.getmtime(path) < 120:
+            skipped_live += 1
+            continue
+    except OSError:
+        continue
+    try:
+        with open(path) as f:
+            recs = [json.loads(l) for l in f if l.strip()]
+    except Exception:
+        continue
+    saw_cs, clean = False, True
+    for r in recs:
+        if r.get("type") == "assistant":       # gerçek konuşma var → dokunma
+            clean = False; break
+        if r.get("type") == "user":
+            for tx in texts(r.get("message") or {}):
+                s = tx.strip()
+                if not s:
+                    continue
+                if s.startswith("<bash-input>"):
+                    # komutu gerçekten ayrıştır: "docs"/"specs" gibi isimler
+                    # "cs" içerdiği için alt-dize kontrolü yanlış eşleşirdi
+                    for cmd in BASH_RE.findall(s):
+                        first = (cmd.strip().lstrip("!").split() or [""])[0]
+                        if first == "cs":
+                            saw_cs = True
+                        else:
+                            clean = False; break
+                    if not clean:
+                        break
+                elif not s.startswith(OK_PREFIX):
+                    clean = False; break
+            if not clean:
+                break
+    if clean and saw_cs:
+        victims.append(path)
+
+print(f"oturum dosyası: {len(victims)} adet yalnızca-!cs oturumu"
+      + (f"  ({skipped_live} canlı/taze oturum atlandı)" if skipped_live else ""))
+for v in victims:
+    print(f"   - {os.path.basename(v)}")
+
+if not apply:
+    print("\nKURU ÇALIŞMA — hiçbir şey silinmedi.")
+    print("Uygulamak için: cs prune --apply")
+    raise SystemExit
+
+if hit:
+    shutil.copy2(hist, hist + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    tmp = hist + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(lines)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, hist)
+    print(f"\nhistory.jsonl temizlendi ({hit} satır silindi, .bak alındı)")
+# Silmek yerine taşı — yanlış eşleşme olursa geri alınabilsin
+graveyard = os.path.join(home, ".claude", ".cs-pruned")
+os.makedirs(graveyard, exist_ok=True)
+for v in victims:
+    shutil.move(v, os.path.join(graveyard, os.path.basename(v)))
+if victims:
+    print(f"{len(victims)} oturum dosyası {graveyard} altına taşındı")
+    print("Geri almak için oradan .claude/projects/<proje>/ içine geri kopyala.")
+PY
+}
+
+cmd_restore() {
+  local last
+  last=$(ls -1t "$BACKUP_DIR"/credentials-*.json 2>/dev/null | head -1 || true)
+  [ -n "$last" ] || die "yedek bulunamadı"
+  cp -p "$last" "$CREDS"
+  chmod 600 "$CREDS"
+  rm -f "$ACTIVE_FILE"
+  ok "geri yüklendi: $(basename "$last")"
+  cmd_status
+}
+
+usage() {
+  cat <<EOF
+${BD}cs${N} — Claude Code hesap değiştirici
+
+  ${B}cs status${N}          Aktif hesap + tüm hesapların token durumu
+  ${B}cs list${N}            status ile aynı
+  ${B}cs use <ad>${N}        <ad> hesabına geç
+  ${B}cs add <ad>${N}        Şu anki credentials'ı yeni hesap olarak kaydet
+  ${B}cs sync${N}            Aktif credentials'ı kendi slotuna geri yaz
+  ${B}cs rm <ad>${N}         Hesabı sil
+  ${B}cs profile${N}         Aktif e-posta/organizasyon bilgisini göster
+  ${B}cs profile save <ad>${N}  Mevcut profili <ad> hesabına ata
+  ${B}cs profile clear${N}   Profili sil → Claude Code sunucudan yeniden çeker
+  ${B}cs prune${N}           !cs izlerini geçmişten temizle (--apply ile sil)
+  ${B}cs restore${N}         Son .credentials.json yedeğini geri yükle
+
+Hesap dosyaları:   $ACCOUNTS_DIR/<ad>.json
+Profil dosyaları:  $ACCOUNTS_DIR/<ad>.profile.json
+E-posta/organizasyon $CLAUDE_JSON içindeki oauthAccount bloğunda tutulur.
+EOF
+}
+
+case "${1:-status}" in
+  status|st|whoami|current) cmd_status ;;
+  list|ls)                  cmd_status ;;
+  use|switch|sw)            shift; cmd_use "${1:-}" ;;
+  add|save)                 shift; cmd_add "${1:-}" ;;
+  sync)                     cmd_sync ;;
+  autosync)                 cmd_autosync ;;
+  rm|remove|delete)         shift; cmd_rm "${1:-}" ;;
+  profile|prof)             shift; cmd_profile "${1:-show}" "${2:-}" ;;
+  prune)                    shift; cmd_prune "${1:-}" ;;
+  restore)                  cmd_restore ;;
+  -h|--help|help)           usage ;;
+  *)                        usage; die "bilinmeyen komut: $1" ;;
+esac
