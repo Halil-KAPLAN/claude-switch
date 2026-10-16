@@ -49,6 +49,13 @@ Credentials are **not** stored in this repo and never should be. Add your accoun
 **Don't copy** `~/.claude/accounts/` between machines: refresh tokens rotate on every refresh,
 so if two machines share a slot, one will log the other out.
 
+## After switching accounts
+
+A running Claude Code session keeps using the account it started with, so restart it after `!cs use`:
+
+- **Terminal:** exit Claude Code and start `claude` again.
+- **VS Code extension:** press `Ctrl+Shift+P` (`Cmd+Shift+P` on macOS) and run **Developer: Reload Window**.
+
 ## Updating
 
 ```bash
