@@ -1,67 +1,67 @@
 # claude-switch
 
-Claude Code içinde birden fazla hesap arasında `!cs` ile geçiş yapmak için küçük bir araç.
-Linux, WSL ve Windows (Git Bash) üzerinde çalışır.
+A small tool for switching between multiple Claude Code accounts with `!cs`, right inside a Claude Code session.
+Works on Linux, WSL and Windows (Git Bash).
 
 ```
-!cs status          aktif hesap + tüm hesapların token durumu
-!cs add <ad>        şu an giriş yapılı hesabı <ad> adıyla kaydet
-!cs use <ad>        <ad> hesabına geç
-!cs sync            aktif credentials'ı kendi slotuna geri yaz
-!cs rm <ad>         hesabı sil
-!cs restore         son yedeği geri yükle
-!cs prune           !cs izlerini geçmişten temizle (--apply ile)
-!cs help            tüm komutlar
+!cs status          show the active account and token status of all accounts
+!cs add <name>      save the currently logged-in account as <name>
+!cs use <name>      switch to <name>
+!cs sync            write the active credentials back to their slot
+!cs rm <name>       delete an account
+!cs restore         restore the latest backup
+!cs prune           remove !cs traces from history (with --apply)
+!cs help            list all commands
 ```
 
-## Kurulum
+## Installation
 
-Gereksinimler: `git`, `bash`, `python3`. Windows'ta [Git for Windows](https://git-scm.com/download/win) (Git Bash) ve Python.
+Requirements: `git`, `bash`, `python3`. On Windows: [Git for Windows](https://git-scm.com/download/win) (Git Bash) and Python.
 
 ```bash
-git clone <repo-adresi> ~/claude-switch      # Windows'ta Git Bash içinde çalıştır
+git clone <repo-url> ~/claude-switch      # on Windows, run this in Git Bash
 ~/claude-switch/install.sh
 ```
 
-Kurulum şunları yapar:
+The installer:
 
-1. `~/.local/bin/cs` → bu repodaki `bin/cs`'i çağıran küçük bir shim kurar
-   (Windows'ta ayrıca PowerShell/cmd için `cs.cmd`).
-2. `~/.claude/settings.json` içine ekler (diğer ayarlara dokunmaz, önce `.bak-*` yedeği alır):
-   - `"respondToBashCommands": false` → `!cs` çalışınca model cevap vermez
-   - Hook'lar: oturum başı/sonu ve her cevaptan sonra `cs autosync`
-     (yenilenen token'ları hesabın slotuna yazar), açılışta `cs prune --apply`.
+1. Installs `~/.local/bin/cs`, a small shim that calls `bin/cs` in this repo
+   (plus `cs.cmd` on Windows, so it also works from PowerShell/cmd).
+2. Adds the following to `~/.claude/settings.json` (other settings are left untouched; a `.bak-*` backup is taken first):
+   - `"respondToBashCommands": false`, so the model doesn't reply after a `!cs` command
+   - Hooks: `cs autosync` at session start/end and after every response
+     (writes refreshed tokens back to the account's slot), and `cs prune --apply` at startup.
 
-Tekrar çalıştırmak güvenlidir; hook'lar çiftlenmez. Sonra açık Claude oturumlarını yeniden başlat.
+Running it again is safe; hooks are never duplicated. Restart any open Claude Code sessions afterwards.
 
-## Yeni bir bilgisayarda hesapları eklemek
+## Adding accounts on a new machine
 
-Credentials bu repoda **yoktur** ve olmamalıdır. Her bilgisayarda hesapları bir kez ekle:
+Credentials are **not** stored in this repo and never should be. Add your accounts once on each machine:
 
 ```
-/login              # 1. hesapla giriş
-!cs add is
-/login              # 2. hesapla giriş
-!cs add kisisel
-!cs use is
+/login              # log in with the first account
+!cs add work
+/login              # log in with the second account
+!cs add personal
+!cs use work
 ```
 
-`~/.claude/accounts/` klasörünü bilgisayarlar arasında **kopyalama**: refresh token'lar her
-yenilemede değişir, iki makine aynı slotu paylaşırsa biri diğerinin oturumunu düşürür.
+**Don't copy** `~/.claude/accounts/` between machines: refresh tokens rotate on every refresh,
+so if two machines share a slot, one will log the other out.
 
-## Güncelleme
+## Updating
 
 ```bash
 cd ~/claude-switch && git pull
 ```
 
-Shim doğrudan repodaki script'i çağırdığı için yeniden kurmaya gerek yok.
-Repoyu başka bir klasöre taşırsan `install.sh`'ı tekrar çalıştır.
+The shim calls the script in the repo directly, so there's no need to reinstall.
+If you move the repo to a different folder, run `install.sh` again.
 
-## Kaldırma
+## Uninstalling
 
 ```bash
 rm ~/.local/bin/cs ~/.local/bin/cs.cmd
 ```
 
-Ardından `~/.claude/settings.json` içinden `respondToBashCommands` satırını ve `cs` içeren hook'ları sil.
+Then remove the `respondToBashCommands` line and the hooks that call `cs` from `~/.claude/settings.json`.
